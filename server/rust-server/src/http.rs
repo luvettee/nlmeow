@@ -763,6 +763,9 @@ async fn import_to_account_handler(
     )
     .await?;
 
+    // Invalidate cached module since user data changed
+    state.invalidate_module(user.id).await;
+
     let live_insert_sent = if matches!(share.item_type.as_str(), "Script" | "Config" | "Style") {
         let sent = ws::push_live_insert(
             &state,
@@ -1341,6 +1344,10 @@ async fn admin_create_log(
         &req.author,
     )
     .await?;
+
+    // Invalidate cached module since user data changed
+    state.invalidate_module(user_id).await;
+
     Ok((StatusCode::CREATED, axum::Json(json!(entry))))
 }
 
@@ -1367,6 +1374,10 @@ async fn admin_update_log(
         &req.author,
     )
     .await?;
+
+    // Invalidate cached module since user data changed
+    state.invalidate_module(user_id).await;
+
     match entry {
         Some(e) => Ok(axum::Json(json!(e)).into_response()),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
@@ -1379,6 +1390,10 @@ async fn admin_delete_log(
 ) -> Result<impl IntoResponse, AppError> {
     tracing::info!("[HTTP] DELETE /admin/users/{}/logs/{}", user_id, log_id);
     let deleted = db::delete_log_entry(&state.db, log_id).await?;
+
+    // Invalidate cached module since user data changed
+    state.invalidate_module(user_id).await;
+
     if deleted {
         Ok(axum::Json(json!({"status": "deleted"})).into_response())
     } else {

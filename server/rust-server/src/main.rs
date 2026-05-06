@@ -10,7 +10,9 @@ mod tls;
 mod ws;
 
 use anyhow::Context;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
+use std::str::FromStr;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -20,21 +22,8 @@ use tokio::sync::{RwLock, mpsc};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-#[cfg(windows)]
-fn hide_console_window() {
-    use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-
-    unsafe {
-        let window = GetConsoleWindow();
-        if window != 0 as _ {
-            ShowWindow(window, SW_HIDE);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn hide_console_window() {}
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc {};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,6 +31,24 @@ pub struct AppState {
     pub raw_module: Option<Vec<u8>>,
     pub ip_tokens: Arc<RwLock<HashMap<IpAddr, String>>>,
     pub live_replies: Arc<RwLock<HashMap<String, HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>>,
+    pub module_cache: Arc<RwLock<HashMap<Uuid, Vec<u8>>>>,
+}
+
+impl AppState {
+    pub async fn get_module(&self, user_id: Uuid) -> Option<Vec<u8>> {
+        let cache = self.module_cache.read().await;
+        cache.get(&user_id).cloned()
+    }
+
+    pub async fn set_module(&self, user_id: Uuid, module_bin: Vec<u8>) {
+        let mut cache = self.module_cache.write().await;
+        cache.insert(user_id, module_bin);
+    }
+
+    pub async fn invalidate_module(&self, user_id: Uuid) {
+        let mut cache = self.module_cache.write().await;
+        cache.remove(&user_id);
+    }
 }
 
 #[tokio::main]
@@ -49,9 +56,6 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
-
-    // Hide console window on Windows
-    hide_console_window();
 
     tracing_subscriber::fmt()
         .with_target(true)
@@ -62,7 +66,12 @@ async fn main() {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| config::DEFAULT_DATABASE_URL.to_string());
 
-    let db = SqlitePool::connect(&database_url)
+    let db_options = SqliteConnectOptions::from_str(&database_url)
+        .expect("failed to parse database URL")
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal);
+
+    let db = SqlitePool::connect_with(db_options)
         .await
         .expect("failed to connect to SQLite");
 
@@ -72,7 +81,7 @@ async fn main() {
         .await
         .expect("failed to run database migrations");
 
-    tracing::info!("Database connected and migrations applied");
+    tracing::info!("Database connected (WAL mode) and migrations applied");
 
     // Seed default "astolfo" user if no users exist
     seed_default_user(&db).await.expect("failed to seed default user");
@@ -84,6 +93,7 @@ async fn main() {
         raw_module,
         ip_tokens: Arc::new(RwLock::new(HashMap::new())),
         live_replies: Arc::new(RwLock::new(HashMap::new())),
+        module_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], config::HTTP_PORT));
