@@ -766,7 +766,7 @@ fn entry_type_id_from_name(entry_type: &str) -> u32 {
 }
 
 async fn create_entry_row(
-    db_pool: &sqlx::PgPool,
+    db_pool: &sqlx::SqlitePool,
     user_id: Uuid,
     entry_id: i32,
     entry_type: u32,

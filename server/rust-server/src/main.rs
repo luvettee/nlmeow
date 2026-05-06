@@ -9,8 +9,8 @@ mod module_builder;
 mod tls;
 mod ws;
 
-use anyhow::{Context, bail};
-use sqlx::PgPool;
+use anyhow::Context;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -20,14 +20,27 @@ use tokio::sync::{RwLock, mpsc};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+#[cfg(windows)]
+fn hide_console_window() {
+    use windows_sys::Win32::Foundation::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    unsafe {
+        let window = GetConsoleWindow();
+        if window != 0 {
+            ShowWindow(window, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_console_window() {}
+
 #[derive(Clone)]
 pub struct AppState {
-    pub db: PgPool,
-    /// If set, send this file as the module blob instead of building from DB.
+    pub db: SqlitePool,
     pub raw_module: Option<Vec<u8>>,
-    /// Maps client IP → auth_token from the most recent WebSocket connection.
     pub ip_tokens: Arc<RwLock<HashMap<IpAddr, String>>>,
-    /// Live FlatBuffer replies queued from HTTP handlers into active WebSockets.
     pub live_replies: Arc<RwLock<HashMap<String, HashMap<Uuid, mpsc::UnboundedSender<Vec<u8>>>>>>,
 }
 
@@ -36,6 +49,9 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+
+    // Hide console window on Windows
+    hide_console_window();
 
     tracing_subscriber::fmt()
         .with_target(true)
@@ -46,13 +62,20 @@ async fn main() {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| config::DEFAULT_DATABASE_URL.to_string());
 
-    let db = PgPool::connect(&database_url)
+    let db = SqlitePool::connect(&database_url)
         .await
-        .expect("failed to connect to PostgreSQL");
+        .expect("failed to connect to SQLite");
 
-    run_migrations_or_validate_schema(&db)
+    // Run migrations
+    sqlx::migrate!("./migrations")
+        .run(&db)
         .await
-        .expect("database schema is not ready");
+        .expect("failed to run database migrations");
+
+    tracing::info!("Database connected and migrations applied");
+
+    // Seed default "astolfo" user if no users exist
+    seed_default_user(&db).await.expect("failed to seed default user");
 
     let raw_module = load_raw_module_arg().expect("failed to load raw module override");
 
@@ -141,6 +164,119 @@ async fn main() {
     }
 }
 
+async fn seed_default_user(db: &SqlitePool) -> anyhow::Result<()> {
+    // Check if any users exist
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(db)
+        .await
+        .context("failed to count users")?;
+
+    if user_count > 0 {
+        tracing::info!("Users exist in database, skipping default user creation");
+        return Ok(());
+    }
+
+    tracing::info!("No users found, attempting to seed default 'astolfo' user");
+
+    // Try to load and parse the seed module
+    let flat = match nl_parser::pipeline::load_module(data::SEED_MODULE_BIN) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("Failed to load seed module (flatbuffers parsing failed): {e}");
+            tracing::warn!("Skipping user seeding - server will start without default user");
+            return Ok(());
+        }
+    };
+
+    let module = match nl_parser::module::Module::from_flatbuffer(&flat) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to parse seed module: {e}");
+            tracing::warn!("Skipping user seeding - server will start without default user");
+            return Ok(());
+        }
+    };
+
+    let skin_data_msgpack = match nl_parser::module::Module::extract_raw_skin_data(&flat) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("Failed to extract skin data: {e}");
+            tracing::warn!("Skipping user seeding - server will start without default user");
+            return Ok(());
+        }
+    };
+
+    let languages_json = serde_json::to_value(&module.languages)?;
+    let base_module = db::insert_base_module(
+        db,
+        "default",
+        module.version as i32,
+        &module.author,
+        module.checksum as i64,
+        module.buffer_capacity as i64,
+        module.enabled as i32,
+        &skin_data_msgpack,
+        &languages_json,
+    )
+    .await
+    .context("failed to insert base module")?;
+
+    // Create "astolfo" user with the hardcoded token
+    let user = db::create_user(
+        db,
+        config::DEFAULT_USERNAME,
+        config::DEFAULT_USER_TOKEN,
+        base_module.id,
+        config::DEFAULT_SERIAL,
+    )
+    .await
+    .context("failed to create astolfo user")?;
+
+    tracing::info!(
+        "Created default user: id={}, username={}, auth_token={}",
+        user.id,
+        user.username,
+        user.auth_token
+    );
+
+    // Seed log entries from the module
+    for (entry_type, entries) in [
+        ("Config", &module.config_log),
+        ("Script", &module.script_log),
+    ] {
+        for entry in entries {
+            let _ = db::create_log_entry(
+                db,
+                user.id,
+                entry.entry_id as i32,
+                entry.timestamp as i32,
+                entry_type,
+                &entry.author,
+            )
+            .await;
+
+            match entry_type {
+                "Config" => {
+                    let _ = db::create_config(db, user.id, entry.entry_id as i32, &entry.name).await;
+                }
+                "Script" => {
+                    let _ = db::create_script(db, user.id, entry.entry_id as i32, &entry.name).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    tracing::info!(
+        "Seeded {} config entries and {} script entries for user {}",
+        module.config_log.len(),
+        module.script_log.len(),
+        user.username
+    );
+
+    Ok(())
+}
+
 fn arg_value(args: &[String], flag: &str) -> anyhow::Result<Option<String>> {
     let Some(index) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
@@ -203,150 +339,4 @@ fn load_raw_module_arg() -> anyhow::Result<Option<Vec<u8>>> {
     }
 
     Ok(None)
-}
-
-async fn run_migrations_or_validate_schema(db: &PgPool) -> anyhow::Result<()> {
-    match sqlx::migrate!("./migrations").run(db).await {
-        Ok(()) => {
-            tracing::info!("Database connected and migrations applied");
-            Ok(())
-        }
-        Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
-            tracing::warn!(
-                "Migration checksum mismatch for version {version}; validating the existing schema"
-            );
-            validate_existing_schema(db)
-                .await
-                .with_context(|| {
-                    format!(
-                        "migration {version} no longer matches the database and the existing schema is incompatible"
-                    )
-                })?;
-            tracing::warn!(
-                "Using the existing database schema despite migration checksum mismatch for version {version}"
-            );
-            Ok(())
-        }
-        Err(err) => Err(err).context("failed to run database migrations"),
-    }
-}
-
-async fn validate_existing_schema(db: &PgPool) -> anyhow::Result<()> {
-    for table in [
-        "base_modules",
-        "users",
-        "log_entries",
-        "scripts",
-        "configs",
-        "styles",
-        "share_codes",
-    ] {
-        ensure_table_exists(db, table).await?;
-    }
-
-    for (table, column) in [
-        ("base_modules", "id"),
-        ("base_modules", "name"),
-        ("base_modules", "version"),
-        ("base_modules", "author"),
-        ("base_modules", "checksum"),
-        ("base_modules", "buffer_capacity"),
-        ("base_modules", "enabled"),
-        ("base_modules", "skin_data_msgpack"),
-        ("base_modules", "languages_json"),
-        ("users", "id"),
-        ("users", "username"),
-        ("users", "auth_token"),
-        ("users", "base_module_id"),
-        ("users", "avatar_png"),
-        ("users", "serial"),
-        ("users", "password_hash"),
-        ("log_entries", "id"),
-        ("log_entries", "user_id"),
-        ("log_entries", "entry_id"),
-        ("log_entries", "timestamp"),
-        ("log_entries", "entry_type"),
-        ("log_entries", "author"),
-        ("scripts", "id"),
-        ("scripts", "user_id"),
-        ("scripts", "entry_id"),
-        ("scripts", "name"),
-        ("scripts", "content"),
-        ("configs", "id"),
-        ("configs", "user_id"),
-        ("configs", "entry_id"),
-        ("configs", "name"),
-        ("configs", "content"),
-        ("styles", "id"),
-        ("styles", "user_id"),
-        ("styles", "entry_id"),
-        ("styles", "name"),
-        ("styles", "content"),
-        ("share_codes", "id"),
-        ("share_codes", "user_id"),
-        ("share_codes", "share_code"),
-        ("share_codes", "item_type"),
-        ("share_codes", "item_id"),
-        ("share_codes", "item_name"),
-    ] {
-        ensure_column_exists(db, table, column).await?;
-    }
-
-    let languages_json_type: Option<String> = sqlx::query_scalar(
-        "SELECT data_type
-         FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'base_modules' AND column_name = 'languages_json'",
-    )
-    .fetch_optional(db)
-    .await
-    .context("failed to inspect public.base_modules.languages_json")?;
-
-    match languages_json_type.as_deref() {
-        Some("json") | Some("jsonb") => Ok(()),
-        Some(other) => bail!(
-            "public.base_modules.languages_json has unsupported type {other}; expected json or jsonb"
-        ),
-        None => bail!("missing column public.base_modules.languages_json"),
-    }
-}
-
-async fn ensure_table_exists(db: &PgPool, table: &str) -> anyhow::Result<()> {
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_name = $1
-        )",
-    )
-    .bind(table)
-    .fetch_one(db)
-    .await
-    .with_context(|| format!("failed to inspect table public.{table}"))?;
-
-    if exists {
-        Ok(())
-    } else {
-        bail!("missing table public.{table}")
-    }
-}
-
-async fn ensure_column_exists(db: &PgPool, table: &str, column: &str) -> anyhow::Result<()> {
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
-        )",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(db)
-    .await
-    .with_context(|| format!("failed to inspect column public.{table}.{column}"))?;
-
-    if exists {
-        Ok(())
-    } else {
-        bail!("missing column public.{table}.{column}")
-    }
 }
