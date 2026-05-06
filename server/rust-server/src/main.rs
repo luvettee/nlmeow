@@ -27,7 +27,7 @@ fn hide_console_window() {
 
     unsafe {
         let window = GetConsoleWindow();
-        if window != 0 {
+        if window != 0 as _ {
             ShowWindow(window, SW_HIDE);
         }
     }
