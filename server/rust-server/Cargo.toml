@@ -27,10 +27,11 @@ flatbuffers = "24.3.25"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.13"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+mimalloc = "0.1"
 
 [profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
-lto = true

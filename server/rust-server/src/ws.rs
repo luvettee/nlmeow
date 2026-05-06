@@ -206,6 +206,12 @@ async fn build_user_module(state: &AppState, token: &str) -> anyhow::Result<Vec<
         .await?
         .ok_or_else(|| anyhow::anyhow!("no user found for token"))?;
 
+    // Check cache first
+    if let Some(cached) = state.get_module(user.id).await {
+        tracing::debug!("[WS] Module cache hit for user {}", user.id);
+        return Ok(cached);
+    }
+
     let base_module = db::get_base_module(&state.db, user.base_module_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("base module not found"))?;
@@ -214,14 +220,19 @@ async fn build_user_module(state: &AppState, token: &str) -> anyhow::Result<Vec<
     let scripts = db::get_user_scripts(&state.db, user.id).await?;
     let styles = db::get_user_styles(&state.db, user.id).await?;
 
-    module_builder::build_module_bin(
+    let module_bin = module_builder::build_module_bin(
         &base_module,
         &user.username,
         user.type7_blob.as_deref(),
         &log_entries,
         &scripts,
         &styles,
-    )
+    )?;
+
+    // Cache the built module
+    state.set_module(user.id, module_bin.clone()).await;
+
+    Ok(module_bin)
 }
 
 async fn drain_messages(socket: &mut WebSocket) {
@@ -472,6 +483,9 @@ async fn handle_client_msg(
                     prefix,
                 )
                 .await;
+            } else {
+                // Invalidate cached module for entries created without initial content
+                state.invalidate_module(user.id).await;
             }
 
             tracing::info!("{prefix} Created entry_id={entry_id} type={type_str} name={name:?}");
@@ -674,6 +688,9 @@ async fn handle_client_msg(
                 tracing::error!("{prefix} failed to delete log entry: {e}");
             }
 
+            // Invalidate cached module since data changed
+            state.invalidate_module(user.id).await;
+
             None
         }
 
@@ -698,6 +715,9 @@ async fn save_type7_blob(
     db::update_user_type7_blob(&state.db, user_id, Some(&blob))
         .await?
         .ok_or_else(|| anyhow::anyhow!("type7 blob update affected no rows"))?;
+
+    // Invalidate cached module since type7 blob changed
+    state.invalidate_module(user_id).await;
 
     tracing::info!(
         "{prefix} saved type7 blob len={} preview={}",
@@ -811,6 +831,9 @@ async fn update_entry_name(
         }
         Err(e) => tracing::error!("{prefix} failed to update {type_str} name: {e}"),
     }
+
+    // Invalidate cached module since data changed
+    state.invalidate_module(user.id).await;
 }
 
 async fn update_entry_content(
@@ -848,6 +871,9 @@ async fn update_entry_content(
         }
         Err(e) => tracing::error!("{prefix} failed to update {type_str} content: {e}"),
     }
+
+    // Invalidate cached module since data changed
+    state.invalidate_module(user.id).await;
 }
 
 async fn duplicate_entry_content(
@@ -887,6 +913,8 @@ async fn duplicate_entry_content(
                 tracing::error!("{prefix} failed to copy duplicate script content: {e}");
                 return None;
             }
+            // Invalidate cached module since data changed
+            state.invalidate_module(user.id).await;
             Some(duplicate_name)
         }
         2 => {
@@ -916,6 +944,8 @@ async fn duplicate_entry_content(
                 tracing::error!("{prefix} failed to copy duplicate style content: {e}");
                 return None;
             }
+            // Invalidate cached module since data changed
+            state.invalidate_module(user.id).await;
             Some(duplicate_name)
         }
         _ => {
@@ -945,6 +975,8 @@ async fn duplicate_entry_content(
                 tracing::error!("{prefix} failed to copy duplicate config content: {e}");
                 return None;
             }
+            // Invalidate cached module since data changed
+            state.invalidate_module(user.id).await;
             Some(duplicate_name)
         }
     }
