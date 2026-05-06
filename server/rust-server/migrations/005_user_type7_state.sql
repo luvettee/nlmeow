@@ -1,0 +1,3 @@
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS type7_blob TEXT,
+    ADD COLUMN IF NOT EXISTS type7_updated_at TIMESTAMPTZ;
