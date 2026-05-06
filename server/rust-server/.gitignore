@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+debug/
+release/
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# TLS certificates
+certs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

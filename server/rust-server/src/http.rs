@@ -1220,10 +1220,10 @@ async fn admin_seed(State(state): State<AppState>) -> Result<impl IntoResponse, 
     )
     .await?;
 
-    // Create default user from the module's author + hardcoded default token
+    // Create default user with hardcoded astolfo username and token
     let user = db::create_user(
         &state.db,
-        &module.author,
+        config::DEFAULT_USERNAME,
         config::DEFAULT_USER_TOKEN,
         base.id,
         DEFAULT_SERIAL,
